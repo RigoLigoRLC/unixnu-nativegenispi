@@ -1,5 +1,7 @@
 # NativeGeniSpi
 
-GENI SPI controller driver.
+GENI SPI controller driver. Provides the SPI bus used by board peripherals.
 
-Maintained as an independent module and included by [UniXNU](https://github.com/UniXNU/UniXNU) at `drivers/NativeGeniSpi`.
+Current state: built into the kernel.
+
+Linked into XNU by `unixnu build kernel`.
