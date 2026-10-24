@@ -26,10 +26,12 @@ int geni_spi_read_info(struct geni_spi *s) {
     s->info.fifo_disabled = (s->info.if_disable & GENI_FIFO_IF_DISABLE) != 0;
     s->info.geni_status = rd(s, SE_GENI_STATUS);
     s->info.hw_param0 = rd(s, SE_HW_PARAM_0);
+    s->info.hw_param1 = rd(s, SE_HW_PARAM_1);
     s->info.qup_hw_version = s->wrapper.rd(s->wrapper.ctx, QUPV3_HW_VER_REG);
     uint32_t major = s->info.qup_hw_version >> 28, minor = (s->info.qup_hw_version >> 16) & 0xfff;
     uint32_t mask = ((major == 3 && minor >= 10) || major > 3) ? 0xff0000u : 0x3f0000u;
     s->info.tx_fifo_depth = (s->info.hw_param0 & mask) >> 16;
+    s->info.rx_fifo_depth = (s->info.hw_param1 & mask) >> 16;
     s->info.fifo_width_bits = (s->info.hw_param0 >> 24) & 0x3f;
     return 0;
 }
@@ -79,6 +81,9 @@ int geni_spi_init(struct geni_spi *s) {
         return GENI_ERR_PARAM;
     if (s->info.fifo_disabled && !s->allow_fifo_disabled && !s->use_dma) return GENI_ERR_NOTSUP;   // GPI DMA path not implemented
     if (s->info.tx_fifo_depth < 4 || s->info.fifo_width_bits != 32) return GENI_ERR_NODEV;
+    if (!s->use_dma && s->info.rx_fifo_depth < 4) {
+        return GENI_ERR_NODEV;
+    }
     // geni_se_init
     irq_clear(s);
     rmw_set(s, SE_GENI_CGC_CTRL, GENI_DEFAULT_CGC_EN);
@@ -88,8 +93,8 @@ int geni_spi_init(struct geni_spi *s) {
     rmw_set(s, SE_IRQ_EN, GENI_IRQ_M | GENI_IRQ_S | GENI_IRQ_DMA_TX | GENI_IRQ_DMA_RX);
     wr(s, SE_GENI_DMA_MODE_EN, rd(s, SE_GENI_DMA_MODE_EN) & ~GENI_DMA_MODE_EN);
     wr(s, SE_GSI_EVENT_EN, 0);
-    wr(s, SE_GENI_RX_WATERMARK_REG, s->info.tx_fifo_depth - 3);
-    wr(s, SE_GENI_RX_RFR_WATERMARK_REG, s->info.tx_fifo_depth - 2);
+    wr(s, SE_GENI_RX_WATERMARK_REG, 0);
+    wr(s, SE_GENI_RX_RFR_WATERMARK_REG, s->info.rx_fifo_depth - 2);
     rmw_set(s, SE_GENI_M_IRQ_EN, GENI_M_COMMON_IRQ_EN);
     rmw_set(s, SE_GENI_S_IRQ_EN, GENI_S_COMMON_IRQ_EN);
     s->tx_wm = 1;
@@ -155,8 +160,26 @@ struct xfer {
 
 static int handle_tx(struct geni_spi *s, struct xfer *x) {
     unsigned bpw = bytes_per_word(s);
-    size_t max = (size_t)(s->info.tx_fifo_depth - s->tx_wm) * bpw;
+    unsigned occupied = rd(s, SE_GENI_TX_FIFO_STATUS) & GENI_TX_WC_MASK;
+    if (occupied >= s->info.tx_fifo_depth || !x->tx_rem) {
+        return x->tx_rem != 0;
+    }
+    size_t max = (size_t)(s->info.tx_fifo_depth - occupied) * bpw;
+    if (x->rx) {
+        // Queued bytes also reserve RX space while the polling thread is descheduled.
+        size_t outstanding = x->rx_rem >= x->tx_rem ? x->rx_rem - x->tx_rem : 0;
+        size_t capacity = (size_t)(s->info.rx_fifo_depth - 2) * bpw;
+        if (outstanding >= capacity) {
+            return 1;
+        }
+        if (max > capacity - outstanding) {
+            max = capacity - outstanding;
+        }
+    }
     if (x->tx_rem < max) max = x->tx_rem;
+    if (max < x->tx_rem) {
+        max -= max % bpw;
+    }
     const uint8_t *p = x->tx + (x->len - x->tx_rem);
     size_t i = 0;
     while (i < max) {
@@ -177,6 +200,9 @@ static void handle_rx(struct geni_spi *s, struct xfer *x) {
     unsigned bpw = bytes_per_word(s);
     uint32_t st = rd(s, SE_GENI_RX_FIFO_STATUS);
     size_t bytes = (size_t)(st & GENI_RX_WC_MASK) * bpw;
+    if (!bytes) {
+        return;
+    }
     if (st & GENI_RX_LAST) {
         unsigned valid = (st >> GENI_RX_LAST_VALID_SHIFT) & GENI_RX_LAST_VALID_MASK;
         if (valid && valid < 4) bytes -= bpw - valid;
@@ -211,9 +237,24 @@ static int wait_bit(struct geni_spi *s, uint32_t bit) {
 static void recover(struct geni_spi *s) {
     wr(s, SE_GENI_TX_WATERMARK_REG, 0);
     wr(s, SE_GENI_M_CMD_CTRL_REG, GENI_M_CMD_CANCEL);
-    if (wait_bit(s, GENI_M_CMD_CANCEL_DONE | GENI_M_CMD_DONE) == 0) return;
-    wr(s, SE_GENI_M_CMD_CTRL_REG, GENI_M_CMD_ABORT);
-    (void)wait_bit(s, GENI_M_CMD_ABORT_DONE | GENI_M_CMD_DONE);
+    int cancelled = wait_bit(s, GENI_M_CMD_CANCEL_DONE | GENI_M_CMD_DONE);
+    if (cancelled || (rd(s, SE_GENI_STATUS) & GENI_STATUS_M_ACTIVE) ||
+        (!s->use_dma && (rd(s, SE_GENI_TX_FIFO_STATUS) & GENI_TX_WC_MASK))) {
+        wr(s, SE_GENI_M_CMD_CTRL_REG, GENI_M_CMD_ABORT);
+        (void)wait_bit(s, GENI_M_CMD_ABORT_DONE | GENI_M_CMD_DONE);
+    }
+    if (!s->use_dma && !(rd(s, SE_GENI_STATUS) & GENI_STATUS_M_ACTIVE)) {
+        for (unsigned i = 0; i < s->info.rx_fifo_depth; ++i) {
+            if (!(rd(s, SE_GENI_RX_FIFO_STATUS) & GENI_RX_WC_MASK)) {
+                break;
+            }
+            (void)rd(s, SE_GENI_RX_FIFOn);
+        }
+    }
+    wr(s, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+    s->recovery_status = rd(s, SE_GENI_STATUS);
+    s->recovery_txfs = rd(s, SE_GENI_TX_FIFO_STATUS);
+    s->recovery_rxfs = rd(s, SE_GENI_RX_FIFO_STATUS);
 }
 
 static int transfer_dma(struct geni_spi *s, const uint8_t *tx, uint8_t *rx, size_t len, int keep_cs) {
@@ -299,6 +340,24 @@ int geni_spi_transfer(struct geni_spi *s, const uint8_t *tx, uint8_t *rx, size_t
         s->cur_bpw = 8;
     }
     if (s->use_dma) return transfer_dma(s, tx, rx, len, keep_cs);
+    s->snap_valid = 0;
+    if ((rd(s, SE_GENI_STATUS) & GENI_STATUS_M_ACTIVE) ||
+        (rd(s, SE_GENI_TX_FIFO_STATUS) & GENI_TX_WC_MASK) ||
+        (rd(s, SE_GENI_RX_FIFO_STATUS) & GENI_RX_WC_MASK)) {
+        recover(s);
+        if ((s->recovery_status & GENI_STATUS_M_ACTIVE) ||
+            (s->recovery_txfs & GENI_TX_WC_MASK) ||
+            (s->recovery_rxfs & GENI_RX_WC_MASK)) {
+            s->snap_irq = rd(s, SE_GENI_M_IRQ_STATUS);
+            s->snap_status = s->recovery_status;
+            s->snap_txfs = s->recovery_txfs;
+            s->snap_rxfs = s->recovery_rxfs;
+            s->snap_tx_remaining = tx ? (uint32_t)len : 0;
+            s->snap_rx_remaining = rx ? (uint32_t)len : 0;
+            s->snap_valid = 1;
+            return GENI_ERR_IO;
+        }
+    }
     struct xfer x = {tx, rx, tx ? len : 0, rx ? len : 0, len};
     uint32_t cmd = 0;
     if (tx) {
@@ -312,33 +371,48 @@ int geni_spi_transfer(struct geni_spi *s, const uint8_t *tx, uint8_t *rx, size_t
     if (cmd == (GENI_M_CMD_TX_ONLY | GENI_M_CMD_RX_ONLY)) cmd = GENI_M_CMD_TX_RX;
     wr(s, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
     wr(s, SE_GENI_M_CMD0, (cmd << GENI_M_OPCODE_SHIFT) | (keep_cs ? GENI_M_PARAM_FRAGMENTATION : 0));
-    if (tx && handle_tx(s, &x)) wr(s, SE_GENI_TX_WATERMARK_REG, s->tx_wm);
+    if (tx) {
+        wr(s, SE_GENI_TX_WATERMARK_REG, s->tx_wm);
+    }
     int status = GENI_ERR_TIMEOUT;
+    uint32_t failure_irq = 0;
     for (unsigned n = 0; n < s->poll_limit; n++) {
         uint32_t st = rd(s, SE_GENI_M_IRQ_STATUS);
-        if (!st) {
-            if (s->se.delay_us) s->se.delay_us(s->se.ctx, 1);
-            continue;
-        }
-        wr(s, SE_GENI_M_IRQ_CLEAR, st);
         if (st & GENI_M_ERRORS) {
+            failure_irq = st;
             status = GENI_ERR_IO;
             break;
         }
-        if (st & (GENI_M_RX_FIFO_WATERMARK | GENI_M_RX_FIFO_LAST)) handle_rx(s, &x);
-        if ((st & GENI_M_TX_FIFO_WATERMARK) && tx) handle_tx(s, &x);
+        if (rx && x.rx_rem) {
+            handle_rx(s, &x);
+        }
         if (st & GENI_M_CMD_DONE) {
-            if (rx && x.rx_rem) handle_rx(s, &x);
             status = (x.tx_rem || x.rx_rem) ? GENI_ERR_IO : 0;
-            if (x.tx_rem) wr(s, SE_GENI_TX_WATERMARK_REG, 0);
-            return status;
+            if (status) {
+                failure_irq = st;
+                break;
+            }
+            wr(s, SE_GENI_M_IRQ_CLEAR, st);
+            return 0;
+        }
+        if (tx && x.tx_rem) {
+            handle_tx(s, &x);
+        }
+        // Acknowledge the sampled status after servicing FIFO levels.
+        if (st) {
+            wr(s, SE_GENI_M_IRQ_CLEAR, st);
+        }
+        if (s->se.delay_us) {
+            s->se.delay_us(s->se.ctx, 1);
         }
     }
     s->snap_dma_tx = rd(s, SE_DMA_TX_IRQ_STAT);
     s->snap_dma_rx = rd(s, SE_DMA_RX_IRQ_STAT);
     s->snap_dma_txin = rd(s, SE_DMA_TX_LEN_IN);
     s->snap_dma_rxin = rd(s, SE_DMA_RX_LEN_IN);
-    s->snap_irq = rd(s, SE_GENI_M_IRQ_STATUS);
+    s->snap_irq = failure_irq ? failure_irq : rd(s, SE_GENI_M_IRQ_STATUS);
+    s->snap_tx_remaining = (uint32_t)x.tx_rem;
+    s->snap_rx_remaining = (uint32_t)x.rx_rem;
     s->snap_status = rd(s, SE_GENI_STATUS);
     s->snap_txfs = rd(s, SE_GENI_TX_FIFO_STATUS);
     s->snap_rxfs = rd(s, SE_GENI_RX_FIFO_STATUS);

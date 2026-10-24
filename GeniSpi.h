@@ -48,6 +48,7 @@
 #define SE_GENI_RX_RFR_WATERMARK_REG 0x814
 #define SE_IRQ_EN 0xe1c
 #define SE_HW_PARAM_0 0xe24
+#define SE_HW_PARAM_1 0xe28
 #define SE_DMA_GENERAL_CFG 0xe30
 #define SE_GSI_EVENT_EN 0xe18
 // Serial-engine DMA registers (qcom-geni-se.c / geni-se.h of the pinned mainline tree).
@@ -138,6 +139,7 @@
 #define GENI_M_ERRORS (GENI_M_CMD_OVERRUN | GENI_M_ILLEGAL_CMD | GENI_M_CMD_FAILURE | GENI_M_RX_FIFO_RD_ERR | \
                        GENI_M_RX_FIFO_WR_ERR | GENI_M_TX_FIFO_RD_ERR | GENI_M_TX_FIFO_WR_ERR)
 // RX_FIFO_STATUS
+#define GENI_TX_WC_MASK 0x0fffffffu
 #define GENI_RX_LAST (1u<<31)
 #define GENI_RX_LAST_VALID_SHIFT 28
 #define GENI_RX_LAST_VALID_MASK 7u
@@ -172,8 +174,8 @@ struct geni_io {
 
 struct geni_spi_info {
     uint32_t fw_revision, protocol, if_disable, hw_param0, geni_status;
-    uint32_t qup_hw_version;
-    unsigned tx_fifo_depth, fifo_width_bits;
+    uint32_t qup_hw_version, hw_param1;
+    unsigned tx_fifo_depth, rx_fifo_depth, fifo_width_bits;
     int fifo_disabled;
 };
 
@@ -189,6 +191,8 @@ struct geni_spi {
     unsigned poll_limit;                // iterations of the completion poll before cancel/abort
     int poll_only;                      // 1: switch the engine interrupt outputs off after init (completion polled); 2: leave them on
     uint32_t snap_irq, snap_status, snap_txfs, snap_rxfs;  // registers read just before a timed-out transfer is cancelled
+    uint32_t snap_tx_remaining, snap_rx_remaining;
+    uint32_t recovery_status, recovery_txfs, recovery_rxfs;
     uint32_t snap_dma_tx, snap_dma_rx, snap_dma_txin, snap_dma_rxin;
     int snap_valid;
     uint32_t last_tx_in, last_rx_in;                  // SE_DMA_{TX,RX}_LEN_IN after the latest DMA transfer: bytes the engine moved
